@@ -9,6 +9,10 @@
  * uses, and whether the engine may open a fixmap slot of its own. anything that
  * changes how we hook belongs here rather than at a call site
  */
+#include <asm/barrier.h>
+#include <asm/pgtable-hwdef.h>
+#include <asm/tlbflush.h>
+
 #include "ds.h"
 #include "hk_patch.h"
 
@@ -55,6 +59,15 @@ static struct {
 	const char *sym;
 	bool installed;
 	int err;
+	/*
+	 * hk_inline.use_br_x17: true when the engine had to clear the pte guarded
+	 * bit and jump back through br x17 so the resume lands mid function. that
+	 * is the one shape a BTI kernel can refuse, so it is reported rather than
+	 * left to be discovered by a faulting reader later. the library clears the
+	 * bit, flushes the tlb and re-reads the entry before it reports success, so
+	 * installed && guarded means the landing pad was verified, not assumed.
+	 */
+	bool guarded;
 } droid_lkm_hook_records[DROID_LKM_HOOK_RECORDS];
 static unsigned int droid_lkm_hook_record_count;
 
@@ -88,11 +101,69 @@ bool droid_lkm_degrade_enabled(void)
 	return droid_lkm_degrade;
 }
 
+/*
+ * the one inline hook shape a bti kernel can refuse. when the resume has to
+ * land in the middle of the hooked function the engine clears the guarded bit
+ * on that page and jumps back through br x17 rather than ret x17. the bit is
+ * part of the translation, so the entry write alone leaves every cpu that
+ * already translated the page on the guarded copy, and the next entry into the
+ * function raises a bti exception, which is fatal.
+ *
+ * hk_inline exposes the pages the engine touched, so this is checkable without
+ * executing the hooked function: confirm the bit is gone from the entry, flush
+ * the page again so no cpu keeps the old translation, and read it back. a hook
+ * that took no guarded page returns immediately, so the common shape pays
+ * nothing for this.
+ */
+static bool droid_lkm_guard_settle(struct hk_inline *h)
+{
+	u32 i;
+
+	if (!h->use_br_x17)
+		return true;
+
+	for (i = 0; i < h->guard_count && i < HK_INLINE_GUARD_MAX; i++) {
+		struct hk_inline_guard *g = &h->guard[i];
+
+		if (!g->active || !g->had_gp)
+			continue;
+		if (!g->ptep)
+			return false;
+
+		if (READ_ONCE(*g->ptep) & PTE_GP)
+			WRITE_ONCE(*g->ptep, g->pte & ~PTE_GP);
+
+		/* the entry is not the translation a cpu is already holding */
+		__flush_tlb_kernel_pgtable(g->page);
+		dsb(ish);
+		isb();
+
+		if (READ_ONCE(*g->ptep) & PTE_GP)
+			return false;
+	}
+
+	return true;
+}
+
 int droid_lkm_hook_install(struct hk_inline *h, const char *sym,
 			   const char *wrap)
 {
 	unsigned int i;
 	int ret = droid_lkm_do_inline_hook(h, sym, wrap);
+
+	/*
+	 * a hook that installed but left a guarded page behind passes every other
+	 * check and then faults on the first entry into the function, from a reader
+	 * that has nothing to do with this module. take it back out instead of
+	 * shipping a trap, the caller already treats a failed hook as a lost feature
+	 */
+	if (!ret && !droid_lkm_guard_settle(h)) {
+		droid_lkm_err("hook: %s left a bti guarded page behind, rolling it back (the branch back would fault)\n",
+			       sym);
+		hk_inline_disable(h);
+		h->orig = 0;
+		ret = -EFAULT;
+	}
 
 	for (i = 0; i < droid_lkm_hook_record_count; i++) {
 		if (droid_lkm_hook_records[i].sym == sym)
@@ -107,6 +178,7 @@ int droid_lkm_hook_install(struct hk_inline *h, const char *sym,
 	droid_lkm_hook_records[i].sym = sym;
 	droid_lkm_hook_records[i].installed = !ret && h->orig;
 	droid_lkm_hook_records[i].err = ret;
+	droid_lkm_hook_records[i].guarded = h->use_br_x17;
 
 	return ret;
 }
@@ -118,10 +190,12 @@ void droid_lkm_hook_report(void)
 	for (i = 0; i < droid_lkm_hook_record_count; i++) {
 		if (droid_lkm_hook_records[i].installed)
 			installed++;
-		droid_lkm_info("hook: %s %s (%d)\n", droid_lkm_hook_records[i].sym,
+		droid_lkm_info("hook: %s %s (%d) br_x17=%d\n",
+			       droid_lkm_hook_records[i].sym,
 			       droid_lkm_hook_records[i].installed ?
 			       "installed" : "NOT installed",
-			       droid_lkm_hook_records[i].err);
+			       droid_lkm_hook_records[i].err,
+			       droid_lkm_hook_records[i].guarded);
 	}
 	droid_lkm_info("hooks: inline=%d %u/%u installed\n",
 		       droid_lkm_inline_hooks_on, installed,

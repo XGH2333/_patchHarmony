@@ -16,6 +16,9 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/mm.h>
+#include <asm/memory.h>
 
 #include "hk_patch.h"
 #include "ds.h"
@@ -25,9 +28,25 @@ DROID_LKM_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #include "ds_pidns.h"
 #include "ds_proc.h"
 #include "ds_nsops.h"
+#include "ds_slot.h"
 #include "proc_inode.h"
 
 static struct inode_operations *droid_lkm_ns_dir_iops;
+/* one shot per ns kind, see droid_lkm_ns_lookup */
+static bool droid_lkm_ns_seen[4];
+/*
+ * true only once the lookup field has been read back and really holds ours. the
+ * module pins itself for this hook and the exit path restores it, so both must
+ * follow the field and not the intent
+ */
+static bool droid_lkm_ns_hook_active;
+/*
+ * off by default. the fourth route below opens the direct map for one page and
+ * cannot put it back, so it only runs when asked for by name
+ */
+static int droid_lkm_ns_force;
+module_param_named(ns_force, droid_lkm_ns_force, int, 0644);
+MODULE_PARM_DESC(ns_force, "open the direct map for the ns dir hook, leaves one rodata page writable there");
 static const struct inode_operations *droid_lkm_ns_link_iops;
 static const struct dentry_operations *droid_lkm_pid_dop;
 static struct dentry *(*droid_lkm_orig_ns_lookup)(struct inode *dir,
@@ -48,12 +67,20 @@ static __nocfi noinline struct dentry *droid_lkm_ns_instantiate(struct dentry *d
 	struct inode *inode;
 	struct proc_inode *ei;
 
-	if (!ops)
+	/*
+	 * both of these answer ENOENT, which is the same thing the caller sees when
+	 * the hook was never reached at all, so each one says which it was
+	 */
+	if (!ops) {
+		droid_lkm_warn("proc ns instantiate: no ns operations for this name\n");
 		return ERR_PTR(-ENOENT);
+	}
 
 	inode = droid_lkm_proc_pid_make_inode(dentry->d_sb, task, S_IFLNK | S_IRWXUGO);
-	if (!inode)
+	if (!inode) {
+		droid_lkm_warn("proc ns instantiate: proc_pid_make_inode returned NULL\n");
 		return ERR_PTR(-ENOENT);
+	}
 
 	ei = PROC_I(inode);
 	inode->i_op = droid_lkm_ns_link_iops;
@@ -185,6 +212,18 @@ static __nocfi noinline struct dentry *droid_lkm_ns_lookup(struct inode *dir, st
 	if (!task)
 		return ERR_PTR(-ENOENT);
 
+	/*
+	 * one line per kind, the first time the kernel asks for it. without it a
+	 * missing entry cannot be told apart from a hook that was never called, and
+	 * that is the whole question when the entry does not show up
+	 */
+	if (kind < ARRAY_SIZE(droid_lkm_ns_seen) && !droid_lkm_ns_seen[kind]) {
+		droid_lkm_ns_seen[kind] = true;
+		droid_lkm_info("proc ns lookup entered for %.*s (kind=%d, task=%s[%d])\n",
+			       (int)dentry->d_name.len, dentry->d_name.name, (int)kind,
+			       task->comm, task_pid_nr(task));
+	}
+
 	droid_lkm_dbg("proc ns lookup: %s[%d] name=%.*s kind=%d\n", task->comm,
 	       task_pid_nr(task), (int)dentry->d_name.len, dentry->d_name.name,
 	       (int)kind);
@@ -242,6 +281,141 @@ static int droid_lkm_proc_steal_ns_link_iops(void)
 }
 
 // pid/ipc entries use the fake ns, host entries share init identity
+/*
+ * the last route, off by default. the kernel keeps the linear mapping of its rodata
+ * read only because rodata_full is on, and that same flag is what makes
+ * set_direct_map_default_noflush willing to flip one direct map pte back to
+ * writable, which is the only primitive in the kernel that touches one. the store
+ * then goes through the linear alias, a mapping neither fixmap writer uses
+ *
+ * it costs something. the page stays writable in the direct map afterwards. the
+ * image mapping this field is read through is untouched and still read only, so
+ * the kernel cannot reach it there by accident, but a direct map write could, and
+ * no exported primitive puts the pte back. that is why it costs a module parameter
+ */
+static int droid_lkm_ns_force_store(unsigned long *field, unsigned long want,
+				   unsigned long lm)
+{
+	static int (*set_default)(struct page *);
+	unsigned long pa = hk_va_to_pa((unsigned long)field);
+	struct page *page;
+	int ret;
+
+	if (!pa)
+		return -ENOENT;
+
+	if (!set_default) {
+		unsigned long fn = droid_lkm_sym("set_direct_map_default_noflush");
+
+		if (!fn || !droid_lkm_indirect_callable(fn)) {
+			droid_lkm_err("proc ns force: set_direct_map_default_noflush is %s, cannot call it\n",
+				      fn ? "without a bti landing pad" : "absent");
+			return -ENOENT;
+		}
+		set_default = (int (*)(struct page *))fn;
+	}
+
+	page = pfn_to_page(pa >> PAGE_SHIFT);
+	ret = set_default(page);
+	if (ret) {
+		droid_lkm_err("proc ns force: the direct map would not open (%d)\n", ret);
+		return ret;
+	}
+
+	memcpy((void *)lm, &want, sizeof(want));
+	dsb(ish);
+	droid_lkm_warn("proc ns force: stored through the linear alias, that page stays writable in the direct map\n");
+	return READ_ONCE(*field) == want ? 0 : -EIO;
+}
+
+/*
+ * three ways to put one word into read only kernel data, tried in order until the
+ * field really holds it: the writer the engine is configured with, the library's
+ * own fixmap slot, and the linear alias of the same physical page. the first two
+ * both go through a fixmap slot, the third does not, so a kernel that swallows
+ * one kind of store gets the other before the hook is called impossible.
+ *
+ * the alias is only writable when the kernel left the linear mapping of rodata
+ * writable, which is why the store is a nofault one: a read only alias answers
+ * -EFAULT instead of taking the machine down
+ */
+static bool droid_lkm_ns_lookup_store(unsigned long *field, unsigned long want)
+{
+	unsigned long *pms;
+	unsigned long pa;
+	unsigned long lm;
+	int fret;
+
+	if (READ_ONCE(*field) == want)
+		return true;
+
+	if (droid_lkm_patch_write(field, want))
+		droid_lkm_warn("proc ns hook: the engine writer refused\n");
+	if (READ_ONCE(*field) == want) {
+		droid_lkm_info("proc ns hook: the engine writer landed\n");
+		return true;
+	}
+
+	fret = hk_write_fixmap(field, &want, sizeof(want));
+	droid_lkm_info("proc ns hook: library writer rc=%d, field now %px\n",
+		       fret, (void *)READ_ONCE(*field));
+	if (READ_ONCE(*field) == want)
+		return true;
+
+	pa = hk_va_to_pa((unsigned long)field);
+	pms = (unsigned long *)droid_lkm_sym("memstart_addr");
+	if (!pa || !pms) {
+		droid_lkm_warn("proc ns hook: no linear alias to try (pa=%lx memstart_addr=%px)\n",
+			       pa, pms);
+		return false;
+	}
+	lm = ((pa - READ_ONCE(*pms)) | PAGE_OFFSET) & PAGE_MASK;
+	lm += (unsigned long)field & ~PAGE_MASK;
+
+	/*
+	 * read the same word through the alias the translation produced before judging
+	 * it. if the two aliases disagree then the physical address this walk returned
+	 * is not the page that backs the field, and everything judged here, writable
+	 * included, was judged about some other page
+	 */
+	{
+		unsigned long via_lm = 0;
+		unsigned long via_img = READ_ONCE(*field);
+		int lret = copy_from_kernel_nofault(&via_lm, (void *)lm,
+						    sizeof(via_lm));
+
+		if (lret)
+			droid_lkm_err("proc ns hook: alias %px is unreadable (%d), the walk did not land on the page that backs the field\n",
+				       (void *)lm, lret);
+		else if (via_lm != via_img)
+			droid_lkm_err("proc ns hook: alias %px reads %px, image reads %px, the translation disagrees\n",
+				       (void *)lm, (void *)via_lm, (void *)via_img);
+		else
+			droid_lkm_info("proc ns hook: alias %px and image both read %px, the translation agrees\n",
+				       (void *)lm, (void *)via_lm);
+	}
+
+	/*
+	 * the alias is only asked to take the store when its own pte says it will. a
+	 * plain store to a read only page is a fault with no way back, and the kernel
+	 * keeps the linear mapping of its rodata read only unless rodata_full is off
+	 */
+	if (!hk_va_writable(lm)) {
+		droid_lkm_info("proc ns hook: the linear alias %px is read only too\n",
+			       (void *)lm);
+		if (!droid_lkm_ns_force)
+			return false;
+		if (droid_lkm_ns_force_store(field, want, lm))
+			return false;
+	} else {
+		memcpy((void *)lm, &want, sizeof(want));
+		dsb(ish);
+	}
+	droid_lkm_info("proc ns hook: linear alias %px stored, field now %px\n",
+		       (void *)lm, (void *)READ_ONCE(*field));
+	return READ_ONCE(*field) == want;
+}
+
 int droid_lkm_proc_init(void)
 {
 	int ret;
@@ -281,20 +455,78 @@ int droid_lkm_proc_init(void)
 		return -ENODATA;
 	}
 
-	ret = droid_lkm_patch_write(&droid_lkm_ns_dir_iops->lookup, (unsigned long)droid_lkm_ns_lookup);
-	if (ret) {
-		droid_lkm_err("cannot patch ns dir lookup: %d\n", ret);
-		return ret;
-	}
+	/*
+	 * the store is one word into read only data and a writer that reports success
+	 * is not the same thing as a mapping that took the store, so the field is
+	 * read back and the hook is only claimed once it really holds ours. the pages
+	 * a kernel refuses to give up are not fatal: pid and ipc entries stay absent
+	 * and everything else here still works, which beats a module that pins itself
+	 * for a hook it never installed
+	 */
+	{
+		struct path live;
+		unsigned long want = (unsigned long)droid_lkm_ns_lookup;
 
-	droid_lkm_info("proc ns lookup hooked (orig=0x%lx)\n",
-		(unsigned long)droid_lkm_orig_ns_lookup);
+		if (!droid_lkm_ns_lookup_store((unsigned long *)&droid_lkm_ns_dir_iops->lookup,
+					      want)) {
+			droid_lkm_warn("proc ns hook: this kernel will not take the ns dir hook (iops=%px level=%d writable=%d), /proc/<pid>/ns/{pid,ipc} stay absent\n",
+				       droid_lkm_ns_dir_iops,
+				       hk_va_level((unsigned long)&droid_lkm_ns_dir_iops->lookup),
+				       hk_va_writable((unsigned long)&droid_lkm_ns_dir_iops->lookup));
+			droid_lkm_orig_ns_lookup = NULL;
+			droid_lkm_pidns_sysctl_init();
+			return 0;
+		}
+
+		droid_lkm_ns_hook_active = true;
+		droid_lkm_info("proc ns lookup hooked (orig=0x%lx)\n",
+			(unsigned long)droid_lkm_orig_ns_lookup);
+
+		if (kern_path("/proc/self/ns", 0, &live)) {
+			droid_lkm_warn("proc ns hook: /proc/self/ns could not be resolved\n");
+		} else {
+			const struct inode_operations *liops = d_inode(live.dentry)->i_op;
+
+			if (liops && liops != droid_lkm_ns_dir_iops) {
+				unsigned long lgot;
+
+				droid_lkm_warn("proc ns hook: the live ns directory carries a different iops (%px vs %px), patching that one too\n",
+					       liops, droid_lkm_ns_dir_iops);
+				if (liops->lookup)
+					droid_lkm_orig_ns_lookup = liops->lookup;
+				if (droid_lkm_patch_write((void *)&liops->lookup, want))
+					droid_lkm_err("proc ns hook: the live iops could not be patched\n");
+				lgot = (unsigned long)READ_ONCE(liops->lookup);
+				droid_lkm_info("proc ns hook: live iops now %px (%s)\n",
+					       (void *)lgot, lgot == want ? "landed" : "did not land");
+			} else {
+				droid_lkm_info("proc ns hook: the live iops is the same struct\n");
+			}
+			path_put(&live);
+		}
+
+		/*
+		 * and then ask for the entry the hook is supposed to serve, from here.
+		 * the answer says whether the patched lookup is the one the vfs reaches,
+		 * which is the question the live iops above can only hint at
+		 */
+		{
+			struct path probe;
+			int pret = kern_path("/proc/self/ns/pid", 0, &probe);
+
+			if (!pret)
+				path_put(&probe);
+			droid_lkm_info("proc ns hook self test: /proc/self/ns/pid -> %d (%s)\n",
+					pret, pret ? "the hook did not serve it" : "served");
+		}
+	}
 
 	if (!try_module_get(THIS_MODULE)) {
 		droid_lkm_err("cannot pin module for the ns hook\n");
 		droid_lkm_patch_write(&droid_lkm_ns_dir_iops->lookup,
 			       (unsigned long)droid_lkm_orig_ns_lookup);
 		droid_lkm_orig_ns_lookup = NULL;
+		droid_lkm_ns_hook_active = false;
 		return -EBUSY;
 	}
 	droid_lkm_dbg("ns hook is permanent: module pinned (rmmod -> -EBUSY)\n");
@@ -311,9 +543,11 @@ void droid_lkm_proc_exit(void)
 {
 	droid_lkm_pidns_sysctl_exit();
 
-	if (droid_lkm_ns_dir_iops && droid_lkm_orig_ns_lookup) {
+	if (droid_lkm_ns_hook_active && droid_lkm_ns_dir_iops &&
+	    droid_lkm_orig_ns_lookup) {
 		droid_lkm_patch_write(&droid_lkm_ns_dir_iops->lookup,
 			       (unsigned long)droid_lkm_orig_ns_lookup);
 		droid_lkm_orig_ns_lookup = NULL;
+		droid_lkm_ns_hook_active = false;
 	}
 }
