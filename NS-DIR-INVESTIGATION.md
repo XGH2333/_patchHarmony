@@ -90,6 +90,44 @@ of that page is read only as well, which is what `rodata_full` means. The store
 was never attempted, because a plain store to a read only page is a fault with
 no way back.
 
+## Route 5: flip the pte and store in place
+
+Routes 1 and 2 share one thing: both end in a fixmap alias. Route 3 removed the
+fixmap but stopped at a read only pte. So the last question was whether the pte
+is the obstacle at all - flip the write bit on the pte of the page the field
+lives on, store through the mapping the kernel itself reads the field with, and
+put the pte back.
+
+Nothing here needs an unexported symbol. `init_mm` comes from kallsyms, the walk
+and the pte helpers are headers, and `__flush_tlb_kernel_pgtable` is a
+`static inline` wrapping a `tlbi vaae1is`:
+
+```c
+/* exactly what the kernel's own set_memory_rw writes: dbm on, ap[2] off */
+nw = __pte((pte_val(old) | PTE_WRITE) & ~PTE_RDONLY);
+set_pte(ptep, nw);
+__flush_tlb_kernel_pgtable(addr);
+
+memcpy((void *)field, &want, sizeof(want));
+dsb(ish);
+
+set_pte(ptep, old);
+__flush_tlb_kernel_pgtable(addr);
+```
+
+The flip itself worked. The walk found a present pte, the pte was changed, the
+translation was invalidated, the store went through the image mapping with no
+fault, and the pte was restored. The field did not change:
+
+```
+proc ns flip: stored with the pte writable and the field still did not change
+```
+
+That is the answer. The obstacle is not the fixmap slot, not the translation,
+and not the permission bit. A store that the MMU is willing to perform through
+the very mapping the kernel reads the field with is still discarded, so the
+discard happens below EL1. There is no route left that stays inside the kernel.
+
 ## Route 4: open the direct map
 
 `set_direct_map_default_noflush()` is the only primitive in the kernel that
@@ -148,13 +186,12 @@ below EL1, and there is no route left that stays inside the kernel.
   reboot to be replaced;
 * keeps loading, because losing two entries is not a reason to lose the rest.
 
-## Open observation
+## The mq_open run, resolved
 
-On the device the trimmed build (`dsh/6.18-fixes`, 6 changed files) scored
-26/2 in one run and 21/3 in another, the extra failure being
-`mq_open errno=38 (Function not implemented)`. A module built from an earlier
-state of this branch scored 26/2 twice in the same session. The runs are not
-comparable enough to call it a regression: the second 21/3 run followed a load
-that had already been unloaded once, `rmmod` was hitting the keepalive pin, and
-the A/B that was supposed to settle it could not reload the module. It should be
-re-measured on a clean boot before this branch is trusted.
+One run scored 21/3 with `mq_open errno=38 (Function not implemented)` on top of
+the two ns failures, which looked like a regression. It did not reproduce: the
+final run of this branch on a clean boot scored 26/2 with `mq_open` passing and
+0 new oops, and the earlier 26/2 runs were on builds that differ only in the
+diagnostic code around it. The 21/3 run followed a load that had already been
+unloaded once, with `rmmod` stuck on the keepalive pin. Treat it as environmental.
+

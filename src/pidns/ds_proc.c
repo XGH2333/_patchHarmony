@@ -19,6 +19,8 @@
 #include <linux/uaccess.h>
 #include <linux/mm.h>
 #include <asm/memory.h>
+#include <asm/pgtable.h>
+#include <asm/tlbflush.h>
 
 #include "hk_patch.h"
 #include "ds.h"
@@ -329,6 +331,90 @@ static int droid_lkm_ns_force_store(unsigned long *field, unsigned long want,
 }
 
 /*
+ * flip the write bit on the pte of the page the field lives on, store through the
+ * mapping the kernel itself reads it with, and put the pte back.
+ *
+ * this is the one route that touches neither fixmap slot. what makes a page read
+ * only is AP[2], the page table entry is ordinary writable memory, and every
+ * primitive needed here is inline, so nothing depends on a symbol this kernel
+ * does not export: init_mm comes from kallsyms, the walk and the pte helpers are
+ * headers, and __flush_tlb_kernel_pgtable is nothing but a tlbi in one. the pte is
+ * put back before returning, so nothing is left writable either way
+ */
+static int droid_lkm_ns_flip_store(unsigned long *field, unsigned long want)
+{
+	struct mm_struct *mm;
+	unsigned long addr = (unsigned long)field;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t old;
+	pte_t nw;
+
+	mm = (struct mm_struct *)droid_lkm_sym("init_mm");
+	if (!mm)
+		return -ENOENT;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return -ENOENT;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return -ENOENT;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return -ENOENT;
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd))
+		return -ENOENT;
+	/*
+	 * a block descriptor fails the table test on arm64, so the leaf question has to
+	 * be asked before the bad one, and a leaf means there is no pte to flip
+	 */
+#if defined(pmd_leaf)
+	if (pmd_leaf(*pmd)) {
+		droid_lkm_warn("proc ns flip: the field is block mapped, there is no pte to flip\n");
+		return -ENOTSUPP;
+	}
+#endif
+	if (pmd_bad(*pmd))
+		return -ENOENT;
+
+	ptep = pte_offset_kernel(pmd, addr);
+	old = READ_ONCE(*ptep);
+	if (!pte_present(old)) {
+		droid_lkm_warn("proc ns flip: the pte is not present\n");
+		return -ENOENT;
+	}
+
+	/* exactly what the kernel's own set_memory_rw writes: dbm on, ap[2] off */
+	nw = __pte((pte_val(old) | PTE_WRITE) & ~PTE_RDONLY);
+
+	if (pte_val(nw) != pte_val(old)) {
+		set_pte(ptep, nw);
+		__flush_tlb_kernel_pgtable(addr);
+	}
+
+	memcpy((void *)field, &want, sizeof(want));
+	dsb(ish);
+
+	if (pte_val(nw) != pte_val(old)) {
+		set_pte(ptep, old);
+		__flush_tlb_kernel_pgtable(addr);
+	}
+
+	if (READ_ONCE(*field) != want) {
+		droid_lkm_warn("proc ns flip: stored with the pte writable and the field still did not change\n");
+		return -EIO;
+	}
+
+	droid_lkm_info("proc ns flip: stored in place with the pte flipped, and the pte is back to read only\n");
+	return 0;
+}
+
+/*
  * three ways to put one word into read only kernel data, tried in order until the
  * field really holds it: the writer the engine is configured with, the library's
  * own fixmap slot, and the linear alias of the same physical page. the first two
@@ -360,6 +446,13 @@ static bool droid_lkm_ns_lookup_store(unsigned long *field, unsigned long want)
 	droid_lkm_info("proc ns hook: library writer rc=%d, field now %px\n",
 		       fret, (void *)READ_ONCE(*field));
 	if (READ_ONCE(*field) == want)
+		return true;
+
+	/*
+	 * both writers above go through a fixmap slot, which is the one thing they have
+	 * in common. flip the pte of the page itself and store in place instead
+	 */
+	if (!droid_lkm_ns_flip_store(field, want))
 		return true;
 
 	pa = hk_va_to_pa((unsigned long)field);
