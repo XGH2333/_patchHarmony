@@ -600,8 +600,23 @@ int droid_lkm_proc_init(void)
 				droid_lkm_pidns_sysctl_init();
 				return 0;
 			}
+			/*
+			 * the wrap left a branch in kernel text that jumps into this
+			 * module. unlike a table slot that can be restored by hand, a
+			 * module that goes away with its trampoline still installed
+			 * takes the next reader of /proc/<pid>/ns/pid down with it, so
+			 * the module is pinned exactly like the table route pins it
+			 */
+			if (!try_module_get(THIS_MODULE)) {
+				droid_lkm_err("proc ns hook: cannot pin module for the text wrap, rolling it back\n");
+				hk_inline_unhook(&droid_lkm_nsdir_hook);
+				droid_lkm_orig_ns_lookup = NULL;
+				droid_lkm_pidns_sysctl_init();
+				return 0;
+			}
 			droid_lkm_nsdir_text = true;
 			droid_lkm_ns_hook_active = true;
+			droid_lkm_dbg("ns hook is permanent: module pinned (rmmod -> -EBUSY)\n");
 			droid_lkm_info("proc ns dir served by a wrap of proc_ns_dir_lookup (the lookup table is write protected here), orig=0x%lx\n",
 				       (unsigned long)droid_lkm_orig_ns_lookup);
 			{
