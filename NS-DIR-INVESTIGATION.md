@@ -186,6 +186,64 @@ below EL1, and there is no route left that stays inside the kernel.
   reboot to be replaced;
 * keeps loading, because losing two entries is not a reason to lose the rest.
 
+## The answer: XKIP, a pKVM hypervisor component at EL2
+
+A purpose built probe module (in the `nsprobe/` workspace directory, built
+against the same DDK, addresses handed in as module parameters because
+`kallsyms_lookup_name` carries no bti pad on this kernel) measured the behaviour
+of the protected page directly. The module list of the running kernel names the
+protection stack: **pkvm_xkip**, with hypervisor side symbols
+
+```
+__kvm_nvhe_kmem_rodata_protection_enable
+__kvm_nvhe_ktext_pte_protection_enable
+__kvm_nvhe_kmem_rwdata_protection_enable
+__kvm_nvhe_kernel_ptes_update_handler
+__kvm_nvhe_xkip_perm_fault_handler
+```
+
+so the protection is Xiaomi's Kernel Integrity Protection running at EL2, above
+the kernel and above anything any module can reach.
+
+What the probe measured on the page holding proc_ns_dir_inode_operations, against
+a control page (kptr_restrict, ordinary writable .data) where every operation
+works:
+
+| operation | control page | protected page |
+|---|---|---|
+| plain load | works | works |
+| plain store after flipping the stage-1 pte writable | lands | **silently dropped** |
+| kernel's fixmap poke (aarch64_insn_patch_text) | n/a | **dropped** |
+| HooKern's own fixmap poke | n/a | **dropped** |
+| `dc ivac` by VA | works | **trapped, injected as a translation fault** |
+
+The cache maintenance trap is the one that closed the case. `dc ivac` on the
+protected address raised a data abort with ESR 0x9600014f: write, translation
+fault, level 3, against a page whose level 3 entry had just been walked and read
+successfully. Only a hypervisor can explain that: it intercepts the cache
+operation and injects a fault it chose, which is what xkip_perm_fault_handler
+exists for. A store through a stage 1 writable pte completes without a fault and
+without a trace, which is what a stage 2 drop looks like.
+
+So the answer to the original question is a clean no: on this device there is no
+EL1 route to the memory the ns dir hook needs. The legitimate channel would have
+to be the same one KernelSU's comment describes for MTK's MKP - a grant ticket
+handed out by the hypervisor, which on this device would be XKIP's own service.
+
+## Two side findings worth keeping
+
+* **no cpu stopper threads exist on this device**, so `stop_machine()` never
+  completes. Any patch path that uses it - including the kernel's own
+  `aarch64_insn_patch_text` - cannot run at runtime here. The first probe paid
+  for this: a kprobe it registered left the kprobe optimizer waiting in
+  stop_machine, and every later module load blocked inside
+  `trace_kprobe_module_callback` until the next reboot.
+* the kernel is built with `-mbranch-protection=standard`: functions whose
+  address nothing takes start at `paciasp` with no bti, and address taken ones
+  start at `bti c`, encoded 0xd503245f by this toolchain. What decides whether
+  an indirect branch may land there is the guarded bit of the page, not the pad
+  alone.
+
 ## The mq_open run, resolved
 
 One run scored 21/3 with `mq_open errno=38 (Function not implemented)` on top of
