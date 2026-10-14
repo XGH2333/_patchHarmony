@@ -244,6 +244,34 @@ handed out by the hypervisor, which on this device would be XKIP's own service.
   an indirect branch may land there is the guarded bit of the page, not the pad
   alone.
 
+## The feature is still achievable: wrap the function, not the table
+
+The refusal above is about one address. What that address holds is a pointer to
+`proc_ns_dir_lookup`, a small function in kernel text, and **kernel text is
+patchable on the very device that refuses the table** - the three inline hooks
+this module already installs (create_new_namespaces, copy_namespaces,
+proc_pid_status) work there. So the same feature is had by wrapping the lookup
+function itself and calling the original trampoline, instead of redirecting the
+table slot to the wrapper.
+
+The wrapper is the module's existing `droid_lkm_ns_lookup` unchanged: only its
+origin changes, from a table slot to the hook's trampoline. On the device:
+
+```
+[droid_lkm] proc ns dir served by a wrap of proc_ns_dir_lookup (the lookup table is write protected here)
+[droid_lkm] hook: proc_ns_dir_lookup installed (0) br_x17=0
+[droid_lkm] hooks: inline=1 4/4 installed
+[droid_lkm] proc ns hook self test: /proc/self/ns/pid -> 0 (served)
+
+readlink /proc/self/ns/pid  -> pid:[4026531836]  rc=0
+readlink /proc/self/ns/ipc  -> ipc:[4026531839]  rc=0
+=========== 28 passed, 0 failed ===========   0 oops   rmmod rc=0
+```
+
+The whole feature set - including the two entries that were missing - now works
+on a device with XKIP at EL2. The table write stays the first choice where it is
+allowed, and the text wrap is the fallback where it is not.
+
 ## The mq_open run, resolved
 
 One run scored 21/3 with `mq_open errno=38 (Function not implemented)` on top of
